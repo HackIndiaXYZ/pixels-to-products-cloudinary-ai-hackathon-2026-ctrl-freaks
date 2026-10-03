@@ -10,10 +10,10 @@ import type {
 } from './types';
 import { labelize } from './taxonomy';
 import {
-  cldLoadStore,
-  cldUploadStore,
-  emptyStoreData,
-  type PersistentStoreData,
+  deleteJson,
+  downloadJson,
+  listRawResources,
+  uploadJson,
 } from './cloudinary/persist';
 
 // ─── DEMO SEED DATA (Always available for instant exploration) ────────────────
@@ -226,65 +226,92 @@ const DEMO_PROJECT_IDS = new Set([DEMO_PROJECT_ID, DEMO_PROJECT2_ID]);
 const DEMO_MATERIAL_IDS = new Set(DEMO_MATERIALS.map((m) => m.id));
 
 // ─── PERSISTENT STORAGE ENGINE ────────────────────────────────────────────────
-// Survives separate Vercel serverless invocations by persisting to Cloudinary raw JSON storage.
+// Per-entity durable Cloudinary raw JSON storage.
 // Fast in-process memory cache for warm lambda performance.
 
-let memoryStoreCache: PersistentStoreData | null = null;
-let lastLoadTime = 0;
-const CACHE_TTL_MS = 10_000; // 10s memory cache TTL to catch cross-lambda writes
+const PREFIX_PROJECTS = 'raw-reuse/db/projects/';
+const PREFIX_MEDIA = 'raw-reuse/db/media/';
+const PREFIX_MATERIALS = 'raw-reuse/db/materials/';
+const PREFIX_REUSE_REQUESTS = 'raw-reuse/db/reuse-requests/';
+const PREFIX_REUSE_MATCHES = 'raw-reuse/db/reuse-matches/';
+const PREFIX_CONCEPTS = 'raw-reuse/db/concepts/';
 
-async function getStoreData(): Promise<PersistentStoreData> {
-  const now = Date.now();
-  if (memoryStoreCache && now - lastLoadTime < CACHE_TTL_MS) {
-    return memoryStoreCache;
-  }
-
-  try {
-    const loaded = await cldLoadStore();
-    if (loaded) {
-      memoryStoreCache = loaded;
-      lastLoadTime = now;
-      return memoryStoreCache;
-    }
-  } catch (err) {
-    console.warn('[store] Could not load store from Cloudinary, using memory cache:', err);
-  }
-
-  if (!memoryStoreCache) {
-    memoryStoreCache = emptyStoreData();
-    lastLoadTime = now;
-  }
-  return memoryStoreCache;
+function projectPublicId(id: string): string {
+  return `${PREFIX_PROJECTS}${id}.json`;
+}
+function mediaPublicId(id: string): string {
+  return `${PREFIX_MEDIA}${id}.json`;
+}
+function materialPublicId(id: string): string {
+  return `${PREFIX_MATERIALS}${id}.json`;
+}
+function reuseRequestPublicId(id: string): string {
+  return `${PREFIX_REUSE_REQUESTS}${id}.json`;
+}
+function reuseMatchPublicId(id: string): string {
+  return `${PREFIX_REUSE_MATCHES}${id}.json`;
+}
+function conceptPublicId(id: string): string {
+  return `${PREFIX_CONCEPTS}${id}.json`;
 }
 
-async function persistStoreData(data: PersistentStoreData): Promise<void> {
-  memoryStoreCache = data;
-  lastLoadTime = Date.now();
-  try {
-    await cldUploadStore(data);
-  } catch (err) {
-    console.error('[store] Critical: Failed to persist store to Cloudinary:', err);
-    throw err;
-  }
-}
+// In-process memory optimization caches:
+const projectsCache = new Map<string, ProjectRow>();
+const mediaCache = new Map<string, MediaAssetRow>();
+const materialsCache = new Map<string, MaterialRow>();
+const reuseRequestsCache = new Map<string, ReuseRequestRow>();
+const reuseMatchesCache = new Map<string, ReuseMatchRow>();
+const conceptsCache = new Map<string, GeneratedConceptRow>();
 
 // ─── PUBLIC STORE API ─────────────────────────────────────────────────────────
 
 export const store = {
   async listProjects(): Promise<Array<ProjectRow & { media_count: number; material_count: number }>> {
-    const data = await getStoreData();
-    const persistent = Object.values(data.projects);
+    const projectPublicIds = await listRawResources(PREFIX_PROJECTS);
+    await Promise.all(
+      projectPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_PROJECTS, '').replace('.json', '');
+        if (!projectsCache.has(id)) {
+          const row = await downloadJson<ProjectRow>(pubId);
+          if (row) projectsCache.set(id, row);
+        }
+      }),
+    );
 
-    const allProjects = [...DEMO_PROJECTS, ...persistent.filter((p) => !DEMO_PROJECT_IDS.has(p.id))];
+    const [mediaPublicIds, materialPublicIds] = await Promise.all([
+      listRawResources(PREFIX_MEDIA),
+      listRawResources(PREFIX_MATERIALS),
+    ]);
+
+    await Promise.all([
+      ...mediaPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_MEDIA, '').replace('.json', '');
+        if (!mediaCache.has(id)) {
+          const row = await downloadJson<MediaAssetRow>(pubId);
+          if (row) mediaCache.set(id, row);
+        }
+      }),
+      ...materialPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_MATERIALS, '').replace('.json', '');
+        if (!materialsCache.has(id)) {
+          const row = await downloadJson<MaterialRow>(pubId);
+          if (row) materialsCache.set(id, row);
+        }
+      }),
+    ]);
+
+    const persistentProjects = Array.from(projectsCache.values());
+    const allProjects = [...DEMO_PROJECTS, ...persistentProjects.filter((p) => !DEMO_PROJECT_IDS.has(p.id))];
 
     return allProjects.map((p) => {
-      const mediaCount = DEMO_PROJECT_IDS.has(p.id)
+      const isDemo = DEMO_PROJECT_IDS.has(p.id);
+      const mediaCount = isDemo
         ? DEMO_MEDIA.filter((m) => m.project_id === p.id).length
-        : Object.values(data.mediaAssets).filter((m) => m.project_id === p.id).length;
+        : Array.from(mediaCache.values()).filter((m) => m.project_id === p.id).length;
 
-      const matCount = DEMO_PROJECT_IDS.has(p.id)
+      const matCount = isDemo
         ? DEMO_MATERIALS.filter((m) => m.project_id === p.id).length
-        : Object.values(data.materials).filter((m) => m.project_id === p.id).length;
+        : Array.from(materialsCache.values()).filter((m) => m.project_id === p.id).length;
 
       return {
         ...p,
@@ -297,8 +324,18 @@ export const store = {
   async getProject(id: string): Promise<ProjectRow | null> {
     const demo = DEMO_PROJECTS.find((p) => p.id === id);
     if (demo) return demo;
-    const data = await getStoreData();
-    return data.projects[id] ?? null;
+
+    if (projectsCache.has(id)) {
+      return projectsCache.get(id)!;
+    }
+
+    const project = await downloadJson<ProjectRow>(projectPublicId(id));
+    if (project) {
+      projectsCache.set(id, project);
+      return project;
+    }
+
+    return null;
   },
 
   async createProject(input: {
@@ -307,7 +344,6 @@ export const store = {
     project_type?: string | null;
     description?: string | null;
   }): Promise<ProjectRow> {
-    const data = await getStoreData();
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     const project: ProjectRow = {
@@ -319,8 +355,10 @@ export const store = {
       created_at: now,
       updated_at: now,
     };
-    data.projects[id] = project;
-    await persistStoreData(data);
+
+    await uploadJson(projectPublicId(id), project);
+    projectsCache.set(id, project);
+
     return project;
   },
 
@@ -328,8 +366,19 @@ export const store = {
     if (DEMO_PROJECT_IDS.has(projectId)) {
       return DEMO_MEDIA.filter((m) => m.project_id === projectId);
     }
-    const data = await getStoreData();
-    return Object.values(data.mediaAssets)
+
+    const mediaPublicIds = await listRawResources(PREFIX_MEDIA);
+    await Promise.all(
+      mediaPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_MEDIA, '').replace('.json', '');
+        if (!mediaCache.has(id)) {
+          const row = await downloadJson<MediaAssetRow>(pubId);
+          if (row) mediaCache.set(id, row);
+        }
+      }),
+    );
+
+    return Array.from(mediaCache.values())
       .filter((m) => m.project_id === projectId)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   },
@@ -337,15 +386,41 @@ export const store = {
   async getMediaAsset(id: string): Promise<MediaAssetRow | null> {
     const demo = DEMO_MEDIA.find((m) => m.id === id);
     if (demo) return demo;
-    const data = await getStoreData();
-    return data.mediaAssets[id] ?? null;
+
+    if (mediaCache.has(id)) {
+      return mediaCache.get(id)!;
+    }
+
+    const asset = await downloadJson<MediaAssetRow>(mediaPublicId(id));
+    if (asset) {
+      mediaCache.set(id, asset);
+      return asset;
+    }
+
+    return null;
   },
 
   async getMediaAssetByPublicId(publicId: string): Promise<MediaAssetRow | null> {
     const demo = DEMO_MEDIA.find((m) => m.cloudinary_public_id === publicId);
     if (demo) return demo;
-    const data = await getStoreData();
-    return Object.values(data.mediaAssets).find((m) => m.cloudinary_public_id === publicId) ?? null;
+
+    for (const asset of mediaCache.values()) {
+      if (asset.cloudinary_public_id === publicId) return asset;
+    }
+
+    const mediaPublicIds = await listRawResources(PREFIX_MEDIA);
+    for (const pubId of mediaPublicIds) {
+      const id = pubId.replace(PREFIX_MEDIA, '').replace('.json', '');
+      if (!mediaCache.has(id)) {
+        const row = await downloadJson<MediaAssetRow>(pubId);
+        if (row) {
+          mediaCache.set(id, row);
+          if (row.cloudinary_public_id === publicId) return row;
+        }
+      }
+    }
+
+    return null;
   },
 
   async createMediaAsset(input: {
@@ -357,7 +432,6 @@ export const store = {
     original_filename?: string | null;
     mime_type?: string | null;
   }): Promise<MediaAssetRow> {
-    const data = await getStoreData();
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     const asset: MediaAssetRow = {
@@ -374,18 +448,19 @@ export const store = {
       created_at: now,
       updated_at: now,
     };
-    data.mediaAssets[id] = asset;
-    await persistStoreData(data);
+
+    await uploadJson(mediaPublicId(id), asset);
+    mediaCache.set(id, asset);
     return asset;
   },
 
   async updateMediaAssetStatus(id: string, status: MediaAssetRow['analysis_status']): Promise<void> {
-    const data = await getStoreData();
-    const asset = data.mediaAssets[id];
+    const asset = await this.getMediaAsset(id);
     if (asset) {
       asset.analysis_status = status;
       asset.updated_at = new Date().toISOString();
-      await persistStoreData(data);
+      await uploadJson(mediaPublicId(id), asset);
+      mediaCache.set(id, asset);
     }
   },
 
@@ -395,8 +470,19 @@ export const store = {
         (a, b) => (b.ai_confidence ?? 0) - (a.ai_confidence ?? 0),
       );
     }
-    const data = await getStoreData();
-    return Object.values(data.materials)
+
+    const matPublicIds = await listRawResources(PREFIX_MATERIALS);
+    await Promise.all(
+      matPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_MATERIALS, '').replace('.json', '');
+        if (!materialsCache.has(id)) {
+          const row = await downloadJson<MaterialRow>(pubId);
+          if (row) materialsCache.set(id, row);
+        }
+      }),
+    );
+
+    return Array.from(materialsCache.values())
       .filter((m) => m.project_id === projectId)
       .sort((a, b) => (b.ai_confidence ?? 0) - (a.ai_confidence ?? 0));
   },
@@ -404,16 +490,27 @@ export const store = {
   async getMaterial(id: string): Promise<MaterialRow | null> {
     const demo = DEMO_MATERIALS.find((m) => m.id === id);
     if (demo) return demo;
-    const data = await getStoreData();
-    return data.materials[id] ?? null;
+
+    if (materialsCache.has(id)) {
+      return materialsCache.get(id)!;
+    }
+
+    const mat = await downloadJson<MaterialRow>(materialPublicId(id));
+    if (mat) {
+      materialsCache.set(id, mat);
+      return mat;
+    }
+
+    return null;
   },
 
   async saveMaterials(
     materials: Array<Omit<MaterialRow, 'id' | 'created_at' | 'updated_at'>>,
   ): Promise<MaterialRow[]> {
-    const data = await getStoreData();
     const now = new Date().toISOString();
-    const created: MaterialRow[] = materials.map((m) => {
+    const created: MaterialRow[] = [];
+
+    for (const m of materials) {
       const id = crypto.randomUUID();
       const row: MaterialRow = {
         id,
@@ -421,25 +518,31 @@ export const store = {
         created_at: now,
         updated_at: now,
       };
-      data.materials[id] = row;
-      return row;
-    });
+      await uploadJson(materialPublicId(id), row);
+      materialsCache.set(id, row);
+      created.push(row);
+    }
 
-    await persistStoreData(data);
     return created;
   },
 
   async deletePendingMaterials(mediaAssetId: string): Promise<void> {
-    const data = await getStoreData();
-    let changed = false;
-    for (const [id, m] of Object.entries(data.materials)) {
+    const matPublicIds = await listRawResources(PREFIX_MATERIALS);
+    await Promise.all(
+      matPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_MATERIALS, '').replace('.json', '');
+        if (!materialsCache.has(id)) {
+          const row = await downloadJson<MaterialRow>(pubId);
+          if (row) materialsCache.set(id, row);
+        }
+      }),
+    );
+
+    for (const [id, m] of materialsCache.entries()) {
       if (m.media_asset_id === mediaAssetId && m.review_status === 'ai_pending') {
-        delete data.materials[id];
-        changed = true;
+        await deleteJson(materialPublicId(id));
+        materialsCache.delete(id);
       }
-    }
-    if (changed) {
-      await persistStoreData(data);
     }
   },
 
@@ -447,8 +550,19 @@ export const store = {
     if (DEMO_PROJECT_IDS.has(projectId)) {
       return DEMO_REUSE_REQUESTS.filter((r) => r.project_id === projectId);
     }
-    const data = await getStoreData();
-    return Object.values(data.reuseRequests)
+
+    const reqPublicIds = await listRawResources(PREFIX_REUSE_REQUESTS);
+    await Promise.all(
+      reqPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_REUSE_REQUESTS, '').replace('.json', '');
+        if (!reuseRequestsCache.has(id)) {
+          const row = await downloadJson<ReuseRequestRow>(pubId);
+          if (row) reuseRequestsCache.set(id, row);
+        }
+      }),
+    );
+
+    return Array.from(reuseRequestsCache.values())
       .filter((r) => r.project_id === projectId)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   },
@@ -456,8 +570,18 @@ export const store = {
   async getReuseRequest(id: string): Promise<ReuseRequestRow | null> {
     const demo = DEMO_REUSE_REQUESTS.find((r) => r.id === id);
     if (demo) return demo;
-    const data = await getStoreData();
-    return data.reuseRequests[id] ?? null;
+
+    if (reuseRequestsCache.has(id)) {
+      return reuseRequestsCache.get(id)!;
+    }
+
+    const req = await downloadJson<ReuseRequestRow>(reuseRequestPublicId(id));
+    if (req) {
+      reuseRequestsCache.set(id, req);
+      return req;
+    }
+
+    return null;
   },
 
   async createReuseRequest(input: {
@@ -468,7 +592,6 @@ export const store = {
     target_dimensions?: string | null;
     budget_text?: string | null;
   }): Promise<{ request: ReuseRequestRow; matches: ReuseMatchRow[] }> {
-    const data = await getStoreData();
     const reqId = crypto.randomUUID();
     const now = new Date().toISOString();
     const request: ReuseRequestRow = {
@@ -482,7 +605,9 @@ export const store = {
       created_at: now,
       updated_at: now,
     };
-    data.reuseRequests[reqId] = request;
+
+    await uploadJson(reuseRequestPublicId(reqId), request);
+    reuseRequestsCache.set(reqId, request);
 
     const materials = await this.getMaterials(input.project_id);
     const matches: ReuseMatchRow[] = [];
@@ -492,7 +617,6 @@ export const store = {
       let score = 65;
       const reasons: string[] = [];
 
-      // Safe visual-only matching language:
       if (
         (query.includes('divider') || query.includes('partition') || query.includes('screen') || query.includes('door')) &&
         (mat.material_type === 'wooden-door' || mat.material_type === 'timber' || mat.material_type === 'steel-member')
@@ -540,8 +664,9 @@ export const store = {
 
       if (mat.ai_confidence && mat.ai_confidence > 0.9) score += 3;
 
+      const matchId = crypto.randomUUID();
       const matchRow: ReuseMatchRow = {
-        id: crypto.randomUUID(),
+        id: matchId,
         material_id: mat.id,
         reuse_request_id: reqId,
         match_score: Math.min(98, Math.max(45, score)),
@@ -549,21 +674,18 @@ export const store = {
         created_at: now,
       };
 
-      data.reuseMatches[matchRow.id] = matchRow;
+      await uploadJson(reuseMatchPublicId(matchId), matchRow);
+      reuseMatchesCache.set(matchId, matchRow);
       matches.push(matchRow);
     }
 
     matches.sort((a, b) => b.match_score - a.match_score);
-    await persistStoreData(data);
     return { request, matches };
   },
 
   async getMatchesForRequest(
     requestId: string,
   ): Promise<Array<ReuseMatchRow & { material: MaterialRow; sourceMedia: MediaAssetRow | null }>> {
-    const data = await getStoreData();
-
-    // Check demo matches first
     const demoMatches = DEMO_MATCHES.filter((m) => m.reuse_request_id === requestId);
     if (demoMatches.length > 0) {
       return demoMatches.map((m) => {
@@ -573,7 +695,18 @@ export const store = {
       });
     }
 
-    const matches = Object.values(data.reuseMatches)
+    const matchPublicIds = await listRawResources(PREFIX_REUSE_MATCHES);
+    await Promise.all(
+      matchPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_REUSE_MATCHES, '').replace('.json', '');
+        if (!reuseMatchesCache.has(id)) {
+          const row = await downloadJson<ReuseMatchRow>(pubId);
+          if (row) reuseMatchesCache.set(id, row);
+        }
+      }),
+    );
+
+    const matches = Array.from(reuseMatchesCache.values())
       .filter((m) => m.reuse_request_id === requestId)
       .sort((a, b) => b.match_score - a.match_score);
 
@@ -591,8 +724,19 @@ export const store = {
     if (DEMO_MATERIAL_IDS.has(materialId)) {
       return DEMO_CONCEPTS.filter((c) => c.material_id === materialId);
     }
-    const data = await getStoreData();
-    return Object.values(data.generatedConcepts)
+
+    const conceptPublicIds = await listRawResources(PREFIX_CONCEPTS);
+    await Promise.all(
+      conceptPublicIds.map(async (pubId) => {
+        const id = pubId.replace(PREFIX_CONCEPTS, '').replace('.json', '');
+        if (!conceptsCache.has(id)) {
+          const row = await downloadJson<GeneratedConceptRow>(pubId);
+          if (row) conceptsCache.set(id, row);
+        }
+      }),
+    );
+
+    return Array.from(conceptsCache.values())
       .filter((c) => c.material_id === materialId)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   },
@@ -600,20 +744,21 @@ export const store = {
   async saveConcepts(
     concepts: Array<Omit<GeneratedConceptRow, 'id' | 'created_at'>>,
   ): Promise<GeneratedConceptRow[]> {
-    const data = await getStoreData();
     const now = new Date().toISOString();
-    const saved: GeneratedConceptRow[] = concepts.map((c) => {
+    const saved: GeneratedConceptRow[] = [];
+
+    for (const c of concepts) {
       const id = crypto.randomUUID();
       const row: GeneratedConceptRow = {
         id,
         ...c,
         created_at: now,
       };
-      data.generatedConcepts[id] = row;
-      return row;
-    });
+      await uploadJson(conceptPublicId(id), row);
+      conceptsCache.set(id, row);
+      saved.push(row);
+    }
 
-    await persistStoreData(data);
     return saved;
   },
 
@@ -625,7 +770,6 @@ export const store = {
     const sourceMedia = await this.getMediaAsset(material.media_asset_id);
     if (!project || !sourceMedia) return null;
 
-    const data = await getStoreData();
     let match: ReuseMatchRow | null = null;
     let reuseRequest: ReuseRequestRow | null = null;
 
@@ -633,8 +777,21 @@ export const store = {
       match = DEMO_MATCHES.find((m) => m.material_id === materialId) ?? null;
       reuseRequest = match ? DEMO_REUSE_REQUESTS.find((r) => r.id === match!.reuse_request_id) ?? null : null;
     } else {
-      match = Object.values(data.reuseMatches).find((m) => m.material_id === materialId) ?? null;
-      reuseRequest = match ? data.reuseRequests[match.reuse_request_id] ?? null : null;
+      const matchPublicIds = await listRawResources(PREFIX_REUSE_MATCHES);
+      await Promise.all(
+        matchPublicIds.map(async (pubId) => {
+          const id = pubId.replace(PREFIX_REUSE_MATCHES, '').replace('.json', '');
+          if (!reuseMatchesCache.has(id)) {
+            const row = await downloadJson<ReuseMatchRow>(pubId);
+            if (row) reuseMatchesCache.set(id, row);
+          }
+        }),
+      );
+      match = Array.from(reuseMatchesCache.values()).find((m) => m.material_id === materialId) ?? null;
+
+      if (match) {
+        reuseRequest = await this.getReuseRequest(match.reuse_request_id);
+      }
     }
 
     const concepts = await this.getConceptsForMaterial(materialId);
