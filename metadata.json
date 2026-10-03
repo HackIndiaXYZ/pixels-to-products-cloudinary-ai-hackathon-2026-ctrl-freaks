@@ -1,0 +1,8 @@
+{
+  "name": "RAW → REUSE",
+  "description": "Discover what a construction site can save before it becomes waste.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
