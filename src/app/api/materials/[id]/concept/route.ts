@@ -22,7 +22,7 @@ export const POST = route<{ params: Promise<{ id: string }> }>(async (req, ctx) 
   if (!mediaAsset) throw new AppError(404, 'not_found', 'Source media asset not found.');
 
   const input = bodySchema.parse(await readJson(req));
-  const conceptDrafts = generateConceptsForMaterial(
+  const conceptDrafts = await generateConceptsForMaterial(
     material,
     mediaAsset,
     input.prompt,

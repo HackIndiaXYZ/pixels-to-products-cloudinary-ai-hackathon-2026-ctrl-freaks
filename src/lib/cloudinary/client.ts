@@ -136,3 +136,78 @@ export function createUploadSignature(projectId: string) {
     uploadPreset: null,
   };
 }
+
+export interface GeneratedImageResult {
+  assetId: string;
+  publicId: string;
+  secureUrl: string;
+  format?: string;
+  bytes?: number;
+}
+
+/** Call Cloudinary Image Generation API (image_to_image with reference image). */
+export async function generateImageToImage(options: {
+  prompt: string;
+  referenceImageUrl: string;
+  targetPublicId: string;
+}): Promise<GeneratedImageResult> {
+  const { CLOUDINARY_CLOUD_NAME } = serverEnv();
+  const url = `${API}/v2/generate/${CLOUDINARY_CLOUD_NAME}/image_to_image`;
+  const res = await cldFetch(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: basicAuth(),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        prompt: options.prompt,
+        reference_images: [{ source_type: 'url', url: options.referenceImageUrl }],
+        target: {
+          target_type: 'managed_asset',
+          public_id: options.targetPublicId,
+        },
+      }),
+      timeoutMs: 60_000,
+    },
+    'image generation',
+  );
+
+  if (!res.ok) throw await cloudinaryError(res, 'image generation');
+  const json = (await res.json()) as {
+    data?: {
+      assets?: Array<{
+        storage?: {
+          asset_id?: string;
+          public_id?: string;
+          secure_url?: string;
+        };
+        asset_id?: string;
+        public_id?: string;
+        secure_url?: string;
+        format?: string;
+        bytes?: number;
+      }>;
+    };
+  };
+
+  const asset = json.data?.assets?.[0];
+  if (!asset) {
+    throw new AppError(502, 'cloudinary_error', 'Cloudinary Image Generation returned no asset.');
+  }
+
+  const pubId = asset.storage?.public_id || asset.public_id || options.targetPublicId;
+  const secureUrl =
+    asset.storage?.secure_url ||
+    asset.secure_url ||
+    `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/image/upload/${pubId}.png`;
+
+  return {
+    assetId: asset.storage?.asset_id || asset.asset_id || pubId,
+    publicId: pubId,
+    secureUrl,
+    format: asset.format,
+    bytes: asset.bytes,
+  };
+}
